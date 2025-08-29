@@ -13,4 +13,5 @@ const blacklistTokenSchema = new mongoose.Schema({
     }
 });
 
-module.exports = mongoose.model('BlacklistToken', blacklistTokenSchema);
+// ✅ Prevent OverwriteModelError by reusing the model if it exists
+module.exports = mongoose.models.BlacklistToken || mongoose.model('BlacklistToken', blacklistTokenSchema);
