@@ -9,20 +9,22 @@ function initializeSocket(server) {
   io = socketIo(server, {
     cors: {
       origin: [
-        'http://localhost:5173',             // local dev
-        'https://tripzzyride.web.app',       // Firebase Hosting
-        'https://tripzzy.onrender.com'       // backend domain
+        'http://localhost:5173',            // local dev
+        'https://tripzzyride.web.app'       // production frontend
       ],
       methods: ['GET', 'POST'],
-      credentials: true
+      credentials: true,
     },
-    transports: ['websocket', 'polling'],
+    path: '/socket.io',                      // ✅ required for Render/websocket proxy
+    transports: ['websocket', 'polling'],    // ✅ both protocols for safety
+    pingTimeout: 60000,                      // ✅ prevent premature disconnects
+    pingInterval: 25000,
   });
 
   io.on('connection', (socket) => {
     console.log(`✅ Client connected: ${socket.id}`);
 
-    // 🟢 Handle user or captain joining socket
+    // 🟢 Handle join event (user/captain)
     socket.on('join', async (data) => {
       const { userId, userType } = data || {};
       console.log(`📩 Join request from ${userType} - ID: ${userId}, Socket: ${socket.id}`);
@@ -38,9 +40,9 @@ function initializeSocket(server) {
           await captainModel.findByIdAndUpdate(userId, { socketId: socket.id });
         }
 
-        socket.emit('join-success', { message: '✅ Successfully joined socket server' });
+        socket.emit('join-success', { message: '✅ Joined socket server successfully' });
       } catch (error) {
-        console.error('❌ Error updating user socket ID:', error);
+        console.error('❌ Error updating socket ID:', error);
         socket.emit('error', { message: 'Database error' });
       }
     });
@@ -48,16 +50,16 @@ function initializeSocket(server) {
     // 🟢 Handle captain location updates
     socket.on('update-location-captain', async (data) => {
       const { userId, location } = data || {};
-
-      if (!userId || !location || !location.ltd || !location.lng) {
+      if (!userId || !location?.ltd || !location?.lng) {
         return socket.emit('error', { message: 'Invalid location data' });
       }
 
       try {
         await captainModel.findByIdAndUpdate(userId, {
-          location: { ltd: location.ltd, lng: location.lng }
+          location: { ltd: location.ltd, lng: location.lng },
         });
 
+        // Broadcast to all clients that captain’s location changed
         io.emit('captain-location-updated', { userId, location });
 
         socket.emit('update-success', { message: '📍 Location updated successfully' });
@@ -67,32 +69,30 @@ function initializeSocket(server) {
       }
     });
 
-    // 🟢 Carpooling Feature: Create a Carpool
+    // 🟢 Carpooling: Create carpool
     socket.on('create-carpool', async (data) => {
       const { captainId, route, seatsAvailable } = data || {};
-
       try {
         const carpool = new carpoolModel({
           captainId,
           route,
           seatsAvailable,
-          passengers: []
+          passengers: [],
         });
 
         await carpool.save();
 
-        io.emit('carpool-updated', { message: 'New carpool available!', carpool });
-        socket.emit('carpool-created', { message: 'Carpool created successfully!', carpool });
+        io.emit('carpool-updated', { message: '🆕 New carpool available!', carpool });
+        socket.emit('carpool-created', { message: '✅ Carpool created successfully!', carpool });
       } catch (error) {
         console.error('❌ Error creating carpool:', error);
         socket.emit('error', { message: 'Database error' });
       }
     });
 
-    // 🟢 Carpooling Feature: Join a Carpool
+    // 🟢 Carpooling: Join carpool
     socket.on('join-carpool', async (data) => {
       const { carpoolId, userId, userName } = data || {};
-
       try {
         const carpool = await carpoolModel.findById(carpoolId);
         if (!carpool) return socket.emit('error', { message: 'Carpool not found' });
@@ -102,8 +102,8 @@ function initializeSocket(server) {
           carpool.seatsAvailable -= 1;
           await carpool.save();
 
-          io.emit('carpool-updated', { message: 'Carpool updated!', carpool });
-          socket.emit('joined-carpool', { message: 'Successfully joined carpool!', carpool });
+          io.emit('carpool-updated', { message: '🚗 Carpool updated!', carpool });
+          socket.emit('joined-carpool', { message: '✅ Joined carpool successfully!', carpool });
         } else {
           socket.emit('error', { message: 'No seats available' });
         }
@@ -113,13 +113,13 @@ function initializeSocket(server) {
       }
     });
 
-    // 🟢 Handle new ride notification (real-time from backend)
+    // 🟢 Receive new ride event (backend to captains)
     socket.on('new-ride', (data) => {
-      console.log('🚗 New ride event received on backend:', data);
-      io.emit('new-ride', data); // broadcast to all captains (or filter in real implementation)
+      console.log('🚕 New ride event received:', data);
+      io.emit('new-ride', data);
     });
 
-    // 🟢 Disconnect Event
+    // 🟢 Handle disconnection
     socket.on('disconnect', async () => {
       console.log(`⚠️ Client disconnected: ${socket.id}`);
       try {
@@ -132,20 +132,14 @@ function initializeSocket(server) {
   });
 }
 
-// 🟢 Utility function to send direct notifications (used by ride controller)
+// 🟢 Utility: Send direct socket message
 const sendMessageToSocketId = (socketId, messageObject) => {
-  console.log(`📤 Sending message to socket ${socketId}:`, messageObject);
-
-  if (!io) {
-    return console.error('❌ Socket.io not initialized.');
-  }
+  if (!io) return console.error('❌ Socket.io not initialized');
+  console.log(`📤 Sending message to ${socketId}:`, messageObject);
 
   const socket = io.sockets.sockets.get(socketId);
-  if (socket) {
-    socket.emit(messageObject.event, messageObject.data);
-  } else {
-    console.warn(`⚠️ Socket ID ${socketId} not found (user might be offline).`);
-  }
+  if (socket) socket.emit(messageObject.event, messageObject.data);
+  else console.warn(`⚠️ Socket ID ${socketId} not found (user offline).`);
 };
 
 module.exports = { initializeSocket, sendMessageToSocketId };
