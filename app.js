@@ -39,11 +39,11 @@ app.get('/', (req, res) => {
   res.send('Hello World from Tripzzy Backend 🚀');
 });
 
-app.use('/api/users', userRoutes);
-app.use('/api/captains', captainRoutes);
-app.use('/api/maps', mapsRoutes);
-app.use('/api/rides', rideRoutes);
-app.use('/api/carpools', carpoolRoutes);
+app.use('/users', userRoutes);
+app.use('/captains', captainRoutes);
+app.use('/maps', mapsRoutes);
+app.use('/rides', rideRoutes);
+app.use('/carpools', carpoolRoutes);
 
 // --- Error Handler ---
 app.use((err, req, res, next) => {
