@@ -20,6 +20,7 @@ connectToDb();
 // --- CORS Setup ---
 const allowedOrigins = [
   "http://localhost:5173",      // Vite local dev
+  "https://2g5t4mkn-5173.inc1.devtunnels.ms",
   "https://tripzzyride.web.app" // Firebase hosted frontend
 ];
 
