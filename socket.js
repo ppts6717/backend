@@ -1,16 +1,22 @@
 const socketIo = require('socket.io');
 const userModel = require('./models/user.model');
 const captainModel = require('./models/captain.model');
-const carpoolModel = require('./models/carpool.model'); // Import carpool model
+const carpoolModel = require('./models/carpool.model');
 
 let io;
 
 function initializeSocket(server) {
   io = socketIo(server, {
     cors: {
-      origin: '*',
-      methods: ['GET', 'POST']
-    }
+      origin: [
+        'http://localhost:5173',             // local dev
+        'https://tripzzyride.web.app',       // Firebase Hosting
+        'https://tripzzy.onrender.com'       // backend domain
+      ],
+      methods: ['GET', 'POST'],
+      credentials: true
+    },
+    transports: ['websocket', 'polling'], // ensure fallback works
   });
 
   io.on('connection', (socket) => {
@@ -18,17 +24,21 @@ function initializeSocket(server) {
 
     // 🟢 Handle user or captain joining socket
     socket.on('join', async (data) => {
-      const { userId, userType } = data;
+      const { userId, userType } = data || {};
       console.log(`📩 Join request from ${userType} - ID: ${userId}, Socket: ${socket.id}`);
 
       try {
+        if (!userId || !userType) {
+          return socket.emit('error', { message: 'Invalid join payload' });
+        }
+
         if (userType === 'user') {
           await userModel.findByIdAndUpdate(userId, { socketId: socket.id });
         } else if (userType === 'captain') {
           await captainModel.findByIdAndUpdate(userId, { socketId: socket.id });
         }
 
-        socket.emit('join-success', { message: 'Successfully joined socket server' });
+        socket.emit('join-success', { message: '✅ Successfully joined socket server' });
       } catch (error) {
         console.error('❌ Error updating user socket ID:', error);
         socket.emit('error', { message: 'Database error' });
@@ -37,9 +47,9 @@ function initializeSocket(server) {
 
     // 🟢 Handle captain location updates
     socket.on('update-location-captain', async (data) => {
-      const { userId, location } = data;
+      const { userId, location } = data || {};
 
-      if (!location || !location.ltd || !location.lng) {
+      if (!userId || !location || !location.ltd || !location.lng) {
         return socket.emit('error', { message: 'Invalid location data' });
       }
 
@@ -48,10 +58,10 @@ function initializeSocket(server) {
           location: { ltd: location.ltd, lng: location.lng }
         });
 
-        // Notify all connected users (optional: could be filtered later)
+        // Optional: notify all connected users
         io.emit('captain-location-updated', { userId, location });
 
-        socket.emit('update-success', { message: 'Location updated successfully' });
+        socket.emit('update-success', { message: '📍 Location updated successfully' });
       } catch (error) {
         console.error('❌ Error updating location:', error);
         socket.emit('error', { message: 'Database error' });
@@ -60,7 +70,7 @@ function initializeSocket(server) {
 
     // 🟢 Carpooling Feature: Create a Carpool
     socket.on('create-carpool', async (data) => {
-      const { captainId, route, seatsAvailable } = data;
+      const { captainId, route, seatsAvailable } = data || {};
 
       try {
         const carpool = new carpoolModel({
@@ -82,7 +92,7 @@ function initializeSocket(server) {
 
     // 🟢 Carpooling Feature: Join a Carpool
     socket.on('join-carpool', async (data) => {
-      const { carpoolId, userId, userName } = data;
+      const { carpoolId, userId, userName } = data || {};
 
       try {
         const carpool = await carpoolModel.findById(carpoolId);
@@ -107,9 +117,7 @@ function initializeSocket(server) {
     // 🟢 Disconnect Event
     socket.on('disconnect', async () => {
       console.log(`⚠️ Client disconnected: ${socket.id}`);
-
       try {
-        // Clear socketId on disconnect (optional)
         await userModel.updateMany({ socketId: socket.id }, { $unset: { socketId: 1 } });
         await captainModel.updateMany({ socketId: socket.id }, { $unset: { socketId: 1 } });
       } catch (error) {
