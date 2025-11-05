@@ -16,7 +16,7 @@ function initializeSocket(server) {
       methods: ['GET', 'POST'],
       credentials: true
     },
-    transports: ['websocket', 'polling'], // ensure fallback works
+    transports: ['websocket', 'polling'],
   });
 
   io.on('connection', (socket) => {
@@ -58,7 +58,6 @@ function initializeSocket(server) {
           location: { ltd: location.ltd, lng: location.lng }
         });
 
-        // Optional: notify all connected users
         io.emit('captain-location-updated', { userId, location });
 
         socket.emit('update-success', { message: '📍 Location updated successfully' });
@@ -114,6 +113,12 @@ function initializeSocket(server) {
       }
     });
 
+    // 🟢 Handle new ride notification (real-time from backend)
+    socket.on('new-ride', (data) => {
+      console.log('🚗 New ride event received on backend:', data);
+      io.emit('new-ride', data); // broadcast to all captains (or filter in real implementation)
+    });
+
     // 🟢 Disconnect Event
     socket.on('disconnect', async () => {
       console.log(`⚠️ Client disconnected: ${socket.id}`);
@@ -127,7 +132,7 @@ function initializeSocket(server) {
   });
 }
 
-// 🟢 Utility function to send direct notifications
+// 🟢 Utility function to send direct notifications (used by ride controller)
 const sendMessageToSocketId = (socketId, messageObject) => {
   console.log(`📤 Sending message to socket ${socketId}:`, messageObject);
 

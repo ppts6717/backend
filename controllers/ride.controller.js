@@ -4,8 +4,7 @@ const mapService = require('../services/maps.service');
 const { sendMessageToSocketId } = require('../socket');
 const rideModel = require('../models/ride.model');
 
-
-// 🟢 Create a new ride request (for User)
+// 🟢 Create a new ride request (User)
 module.exports.createRide = async (req, res) => {
   const errors = validationResult(req);
   if (!errors.isEmpty()) {
@@ -15,8 +14,7 @@ module.exports.createRide = async (req, res) => {
   const { pickup, destination, vehicleType, rideType, availableSeats, genderPreference } = req.body;
 
   try {
-    console.log("🚕 Creating a new ride request...");
-    console.log("User ID:", req.user._id);
+    console.log('🚕 Creating a new ride request for user:', req.user._id);
 
     const ride = await rideService.createRide({
       user: req.user._id,
@@ -28,47 +26,49 @@ module.exports.createRide = async (req, res) => {
       genderPreference
     });
 
-    // Respond to frontend first
+    // ✅ Respond to frontend immediately
     res.status(201).json(ride);
 
-    // Get pickup coordinates
+    // ✅ Get pickup coordinates
     const pickupCoordinates = await mapService.getAddressCoordinate(pickup);
 
-    // Find nearby captains (20 km radius)
+    // ✅ Find nearby captains (within 20 km radius)
     const captainsInRadius = await mapService.getCaptainsInTheRadius(
       pickupCoordinates.ltd,
       pickupCoordinates.lng,
       20000
     );
 
-    const rideWithUser = await rideModel.findOne({ _id: ride._id }).populate('user');
+    // ✅ Populate user for full ride details
+    const rideWithUser = await rideModel.findById(ride._id).populate('user');
 
-    // Send real-time notification to each captain
+    if (!captainsInRadius?.length) {
+      console.warn('⚠️ No captains found in 20km radius.');
+      return;
+    }
+
+    // ✅ Send ride notification to each nearby captain
     captainsInRadius.forEach((captain) => {
       if (captain.socketId) {
-        console.log(`📡 Sending ride request to Captain (${captain.name}) - Socket: ${captain.socketId}`);
+        console.log(`📡 Notifying Captain ${captain.name} (${captain._id}) via socket ${captain.socketId}`);
         sendMessageToSocketId(captain.socketId, {
           event: 'new-ride',
           data: rideWithUser
         });
       } else {
-        console.warn(`⚠️ Captain ${captain.name} has no active socket connection`);
+        console.warn(`⚠️ Captain ${captain.name} (${captain._id}) has no active socket connection.`);
       }
     });
-
   } catch (err) {
     console.error('❌ Error in createRide:', err);
-    return res.status(500).json({ message: err.message });
+    return res.status(500).json({ message: err.message || 'Internal server error' });
   }
 };
-
 
 // 🟢 Get normal ride fare
 module.exports.getFare = async (req, res) => {
   const errors = validationResult(req);
-  if (!errors.isEmpty()) {
-    return res.status(400).json({ errors: errors.array() });
-  }
+  if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
 
   const { pickup, destination } = req.query;
 
@@ -81,13 +81,10 @@ module.exports.getFare = async (req, res) => {
   }
 };
 
-
 // 🟢 Get carpool fare
 module.exports.calculateCarpoolFare = async (req, res) => {
   const errors = validationResult(req);
-  if (!errors.isEmpty()) {
-    return res.status(400).json({ errors: errors.array() });
-  }
+  if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
 
   const { pickup, destination, availableSeats, rideType } = req.query;
 
@@ -105,13 +102,10 @@ module.exports.calculateCarpoolFare = async (req, res) => {
   }
 };
 
-
 // 🟢 Captain confirms a ride
 module.exports.confirmRide = async (req, res) => {
   const errors = validationResult(req);
-  if (!errors.isEmpty()) {
-    return res.status(400).json({ errors: errors.array() });
-  }
+  if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
 
   const { rideId } = req.body;
 
@@ -119,6 +113,7 @@ module.exports.confirmRide = async (req, res) => {
     const ride = await rideService.confirmRide({ rideId, captain: req.captain });
 
     if (ride.user?.socketId) {
+      console.log(`✅ Sending ride-confirmed event to user socket ${ride.user.socketId}`);
       sendMessageToSocketId(ride.user.socketId, {
         event: 'ride-confirmed',
         data: ride
@@ -132,13 +127,10 @@ module.exports.confirmRide = async (req, res) => {
   }
 };
 
-
-// 🟢 Captain starts the ride
+// 🟢 Captain starts ride
 module.exports.startRide = async (req, res) => {
   const errors = validationResult(req);
-  if (!errors.isEmpty()) {
-    return res.status(400).json({ errors: errors.array() });
-  }
+  if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
 
   const { rideId, otp } = req.query;
 
@@ -146,6 +138,7 @@ module.exports.startRide = async (req, res) => {
     const ride = await rideService.startRide({ rideId, otp, captain: req.captain });
 
     if (ride.user?.socketId) {
+      console.log(`✅ Sending ride-started event to user socket ${ride.user.socketId}`);
       sendMessageToSocketId(ride.user.socketId, {
         event: 'ride-started',
         data: ride
@@ -159,13 +152,10 @@ module.exports.startRide = async (req, res) => {
   }
 };
 
-
-// 🟢 Captain ends the ride
+// 🟢 Captain ends ride
 module.exports.endRide = async (req, res) => {
   const errors = validationResult(req);
-  if (!errors.isEmpty()) {
-    return res.status(400).json({ errors: errors.array() });
-  }
+  if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
 
   const { rideId } = req.body;
 
@@ -173,6 +163,7 @@ module.exports.endRide = async (req, res) => {
     const ride = await rideService.endRide({ rideId, captain: req.captain });
 
     if (ride.user?.socketId) {
+      console.log(`✅ Sending ride-ended event to user socket ${ride.user.socketId}`);
       sendMessageToSocketId(ride.user.socketId, {
         event: 'ride-ended',
         data: ride
