@@ -1,10 +1,11 @@
 const http = require('http');
+const path = require('path');
 const dotenv = require('dotenv');
 const app = require('./app');
 const { initializeSocket } = require('./socket');
 
 // Load environment variables
-dotenv.config();
+dotenv.config({ path: path.resolve(__dirname, '.env') });
 
 const port = process.env.PORT || 5000;
 

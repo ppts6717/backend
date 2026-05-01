@@ -11,7 +11,6 @@
   "license": "ISC",
   "description": "## `/users/register` Endpoint",
   "dependencies": {
-    "@googlemaps/google-maps-services-js": "^3.4.2",
     "axios": "^1.10.0",
     "bcryptjs": "^3.0.2",
     "cookie-parser": "^1.4.7",

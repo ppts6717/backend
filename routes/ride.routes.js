@@ -57,6 +57,11 @@ router.get('/carpool-options',
     rideController.getMatchingCarpools
 )
 
+router.get('/active',
+    authMiddleware.authUser,
+    rideController.getActiveRide
+)
+
 router.post('/join-carpool',
     authMiddleware.authUser,
     body('rideId').isMongoId().withMessage('Invalid ride id'),

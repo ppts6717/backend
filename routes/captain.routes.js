@@ -49,6 +49,13 @@ router.post('/login', [
 
 router.get('/profile', authMiddleware.authCaptain, captainController.getCaptainProfile)
 
+router.patch(
+    '/status',
+    authMiddleware.authCaptain,
+    body('status').isIn([ 'active', 'inactive' ]).withMessage('Invalid captain status'),
+    captainController.updateCaptainAvailability
+)
+
 router.get('/logout', authMiddleware.authCaptain, captainController.logoutCaptain)
 
 

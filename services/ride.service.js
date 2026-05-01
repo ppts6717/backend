@@ -1,5 +1,7 @@
 const crypto = require('crypto');
 const rideModel = require('../models/ride.model');
+const captainModel = require('../models/captain.model');
+const { isSocketConnected } = require('../socket');
 const mapService = require('./maps.service');
 
 const vehicleSeatCapacity = {
@@ -27,6 +29,8 @@ const carpoolDiscoveryConfig = {
 };
 const joinableCarpoolRideStatuses = [ 'accepted', 'ongoing' ];
 const discoverableCarpoolRideStatuses = [ 'accepted', 'ongoing' ];
+const activeUserRideStatuses = [ 'pending', 'accepted', 'ongoing' ];
+const pendingRideRequestTimeoutMs = 45 * 1000;
 
 const shareableVehicleTypes = [ 'auto', 'car' ];
 
@@ -230,6 +234,25 @@ function getPassengerBoardingStatus(allocation) {
 
 module.exports.getPassengerBoardingStatus = getPassengerBoardingStatus;
 
+function getRideViewerRelation(ride, userId) {
+    const normalizedViewerId = normalizeObjectId(userId);
+
+    if (!normalizedViewerId) {
+        return 'viewer';
+    }
+
+    if (normalizeObjectId(ride?.user?._id || ride?.user) === normalizedViewerId) {
+        return 'owner';
+    }
+
+    const viewerIsPassenger = Array.isArray(ride?.passengers) &&
+        ride.passengers.some((passenger) => normalizeObjectId(passenger?._id || passenger) === normalizedViewerId);
+
+    return viewerIsPassenger ? 'passenger' : 'viewer';
+}
+
+module.exports.getRideViewerRelation = getRideViewerRelation;
+
 function shouldViewerWaitForPickup(ride, viewerIsOwner, passengerAllocation) {
     if (!ride || viewerIsOwner) {
         return false;
@@ -254,6 +277,73 @@ function buildRideDetailsQuery(filter) {
 async function getRideWithDetails(filter) {
     return buildRideDetailsQuery(filter);
 }
+
+function hasPendingRideRequestTimedOut(ride) {
+    const createdAtTime = new Date(ride?.createdAt || 0).getTime();
+
+    if (!createdAtTime) {
+        return false;
+    }
+
+    return (Date.now() - createdAtTime) >= pendingRideRequestTimeoutMs;
+}
+
+async function resolvePendingRideState(ride) {
+    if (!ride?._id || ride.status !== 'pending') {
+        return ride;
+    }
+
+    const requestedCaptainIds = Array.isArray(ride.requestedCaptains)
+        ? ride.requestedCaptains.map(normalizeObjectId).filter(Boolean)
+        : [];
+    const rejectedCaptainIds = Array.isArray(ride.rejectedCaptains)
+        ? ride.rejectedCaptains.map(normalizeObjectId).filter(Boolean)
+        : [];
+    const pendingCaptainIds = requestedCaptainIds.filter((captainId) => !rejectedCaptainIds.includes(captainId));
+    const shouldRejectForTimeout = hasPendingRideRequestTimedOut(ride);
+    let hasReachableCaptain = false;
+
+    if (pendingCaptainIds.length > 0) {
+        const pendingCaptains = await captainModel.find({
+            _id: { $in: pendingCaptainIds },
+            socketId: { $nin: [ null, '' ] }
+        }).select('_id socketId');
+
+        hasReachableCaptain = pendingCaptains.some((captain) =>
+            captain.socketId && isSocketConnected(captain.socketId)
+        );
+    }
+
+    const shouldRejectBecauseCaptainSearchEnded =
+        requestedCaptainIds.length > 0 &&
+        (!pendingCaptainIds.length || !hasReachableCaptain);
+
+    if (!shouldRejectForTimeout && !shouldRejectBecauseCaptainSearchEnded) {
+        return ride;
+    }
+
+    const rejectedRide = await rideModel.findOneAndUpdate(
+        {
+            _id: ride._id,
+            status: 'pending',
+            captain: null
+        },
+        {
+            status: 'rejected'
+        },
+        {
+            new: true
+        }
+    );
+
+    if (rejectedRide) {
+        return getRideWithDetails(rejectedRide._id);
+    }
+
+    return getRideWithDetails(ride._id);
+}
+
+module.exports.reconcileRideState = async (ride) => resolvePendingRideState(ride);
 
 function buildCaptainName(captain) {
     const firstName = captain?.fullname?.firstname || '';
@@ -1279,6 +1369,79 @@ function decorateRideForUser(ride, userId) {
 
 module.exports.decorateRideForUser = decorateRideForUser;
 
+async function findLatestActiveRideForUser(userId) {
+    if (!userId) {
+        return null;
+    }
+
+    const rides = await rideModel.find({
+        status: { $in: activeUserRideStatuses },
+        $or: [
+            { user: userId },
+            { passengers: userId }
+        ]
+    })
+        .sort({ updatedAt: -1, createdAt: -1 })
+        .limit(10)
+        .populate('user')
+        .populate('captain')
+        .populate('passengers')
+        .populate('passengerAllocations.user')
+        .select('+otp');
+
+    for (const ride of rides) {
+        const resolvedRide = await resolvePendingRideState(ride);
+
+        if (!resolvedRide) {
+            continue;
+        }
+
+        const decoratedRide = decorateRideForUser(resolvedRide, userId);
+
+        if (activeUserRideStatuses.includes(decoratedRide?.status)) {
+            return decoratedRide;
+        }
+    }
+
+    return null;
+}
+
+function buildActiveRideConflictSummary(activeRide) {
+    if (!activeRide?._id) {
+        return null;
+    }
+
+    return {
+        hasActiveRide: true,
+        rideId: normalizeObjectId(activeRide._id),
+        status: activeRide.status,
+        rideType: activeRide.rideType,
+        viewerRole: activeRide.viewerRole,
+        pickup: activeRide.viewerPickup || activeRide.pickup,
+        destination: activeRide.viewerDestination || activeRide.destination
+    };
+}
+
+function buildActiveRideConflictError(activeRide) {
+    const viewerRole = activeRide?.viewerRole;
+    const isSharedOwner = activeRide?.rideType === 'carpool' && viewerRole === 'owner';
+    const isSharedPassenger = activeRide?.rideType === 'carpool' && viewerRole === 'passenger';
+    const error = new Error(
+        isSharedOwner
+            ? 'You already own an active shared ride. Open that trip or use a different rider account to join it.'
+            : isSharedPassenger
+                ? 'You already joined an active shared ride. Finish that trip before booking another one.'
+                : 'You already have an active ride. Open that trip or finish it before booking another one.'
+    );
+
+    error.statusCode = 409;
+    error.activeRide = activeRide;
+
+    return error;
+}
+
+module.exports.getActiveRideForUser = async ({ userId }) => findLatestActiveRideForUser(userId);
+
 function formatNearbyRide(
     ride,
     vehicleType,
@@ -1321,6 +1484,12 @@ module.exports.createRide = async ({
 }) => {
     if (!user || !pickup || !destination || !rideType) {
         throw new Error('All fields are required');
+    }
+
+    const activeRide = await findLatestActiveRideForUser(user);
+
+    if (activeRide) {
+        throw buildActiveRideConflictError(activeRide);
     }
 
     const normalizedRideType = rideType === 'carpool' ? 'carpool' : 'solo';
@@ -1417,11 +1586,25 @@ module.exports.confirmRide = async ({
         throw new Error('Ride id is required');
     }
 
-    const ride = await rideModel.findById(rideId).populate('user');
+    const existingCaptainRide = await rideModel.findOne({
+        captain: captain?._id,
+        status: { $in: joinableCarpoolRideStatuses },
+        _id: { $ne: rideId }
+    }).select('_id status rideType pickup destination');
+
+    if (existingCaptainRide) {
+        const error = new Error('You already have an active ride. Finish it before accepting another trip.');
+        error.statusCode = 409;
+        throw error;
+    }
+
+    let ride = await rideModel.findById(rideId).populate('user');
 
     if (!ride) {
         throw new Error('Ride not found');
     }
+
+    ride = await resolvePendingRideState(ride);
 
     if (ride.status !== 'pending') {
         const error = new Error('Ride request is no longer available');
@@ -1505,11 +1688,13 @@ module.exports.rejectRide = async ({ rideId, captain }) => {
         throw new Error('Ride id is required');
     }
 
-    const ride = await rideModel.findById(rideId).populate('user');
+    let ride = await rideModel.findById(rideId).populate('user');
 
     if (!ride) {
         throw new Error('Ride not found');
     }
+
+    ride = await resolvePendingRideState(ride);
 
     if (ride.status !== 'pending') {
         const error = new Error('Ride request is already handled');
@@ -1619,6 +1804,16 @@ module.exports.endRide = async ({ rideId, captain }) => {
 module.exports.getMatchingCarpools = async ({ userId, pickup, destination, genderPreference = 'any', bookedSeats = 1 }) => {
     if (!pickup || !destination) {
         throw new Error('Pickup and destination are required');
+    }
+
+    const activeRide = await findLatestActiveRideForUser(userId);
+
+    if (activeRide) {
+        return {
+            totalVehicles: 0,
+            seatBuckets: [],
+            activeRideConflict: buildActiveRideConflictSummary(activeRide)
+        };
     }
 
     const normalizedPreference = [ 'male', 'female', 'any' ].includes(genderPreference)
@@ -1843,6 +2038,12 @@ module.exports.getMatchingCarpools = async ({ userId, pickup, destination, gende
 module.exports.joinCarpoolRide = async ({ rideId, userId, pickup, destination, bookedSeats }) => {
     if (!rideId || !userId || !pickup || !destination) {
         throw new Error('Ride id, user, pickup and destination are required');
+    }
+
+    const activeRide = await findLatestActiveRideForUser(userId);
+
+    if (activeRide) {
+        throw buildActiveRideConflictError(activeRide);
     }
 
     const ride = await getRideWithDetails({
