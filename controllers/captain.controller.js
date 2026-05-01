@@ -1,6 +1,7 @@
 const captainModel = require('../models/captain.model');
 const captainService = require('../services/captain.service');
 const blackListTokenModel = require('../models/blacklistToken.model.js');
+const rideModel = require('../models/ride.model');
 const { validationResult } = require('express-validator');
 
 
@@ -67,7 +68,36 @@ module.exports.loginCaptain = async (req, res, next) => {
 }
 
 module.exports.getCaptainProfile = async (req, res, next) => {
-    res.status(200).json({ captain: req.captain });
+    const [ completedRides, ongoingRides, acceptedRides ] = await Promise.all([
+        rideModel.find({
+            captain: req.captain._id,
+            status: 'completed',
+            completedAt: { $ne: null }
+        }).select('fare'),
+        rideModel.countDocuments({
+            captain: req.captain._id,
+            status: 'ongoing'
+        }),
+        rideModel.countDocuments({
+            captain: req.captain._id,
+            status: 'accepted'
+        })
+    ]);
+
+    const totalEarnings = completedRides.reduce((sum, ride) => sum + (Number(ride.fare) || 0), 0);
+
+    res.status(200).json({
+        captain: {
+            ...req.captain.toObject(),
+            stats: {
+                totalEarnings,
+                completedTrips: completedRides.length,
+                ongoingTrips: ongoingRides,
+                pendingTrips: acceptedRides,
+                statsMode: 'strict-completed-rides-only'
+            }
+        }
+    });
 }
 
 module.exports.logoutCaptain = async (req, res, next) => {

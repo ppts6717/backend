@@ -11,7 +11,28 @@ router.post('/register', [
     body('password').isLength({ min: 6 }).withMessage('Password must be at least 6 characters long'),
     body('vehicle.color').isLength({ min: 3 }).withMessage('Color must be at least 3 characters long'),
     body('vehicle.plate').isLength({ min: 3 }).withMessage('Plate must be at least 3 characters long'),
-    body('vehicle.capacity').isInt({ min: 1 }).withMessage('Capacity must be at least 1'),
+    body('vehicle.capacity')
+      .isInt({ min: 1 })
+      .withMessage('Capacity must be at least 1')
+      .custom((value, { req }) => {
+        const vehicleType = String(req.body?.vehicle?.vehicleType || '').trim().toLowerCase();
+        const maxCapacityByType = {
+          car: 4,
+          motorcycle: 1,
+          auto: 3,
+        };
+        const maxCapacity = maxCapacityByType[vehicleType];
+
+        if (!maxCapacity) {
+          return true;
+        }
+
+        if (Number(value) > maxCapacity) {
+          throw new Error(`Capacity for ${vehicleType} cannot exceed ${maxCapacity}`);
+        }
+
+        return true;
+      }),
     body('vehicle.vehicleType').isIn([ 'car', 'motorcycle', 'auto' ]).withMessage('Invalid vehicle type')
 ],
     captainController.registerCaptain
