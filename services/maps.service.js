@@ -8,8 +8,13 @@ const OLA_CACHE_TTL_MS = {
     '/places/v1/geocode': 1000 * 60 * 60 * 6,
     '/places/v1/reverse-geocode': 1000 * 60 * 30,
     '/places/v1/autocomplete': 1000 * 60 * 5,
+    '/routing/v1/directions/basic': 1000 * 60 * 5,
     '/routing/v1/directions': 1000 * 60 * 5
 };
+const OLA_DIRECTIONS_PATHS = [
+    '/routing/v1/directions/basic',
+    '/routing/v1/directions'
+];
 
 function getOlaMapsApiKey() {
     const apiKey = String(process.env.OLA_MAPS_API_KEY || '').trim();
@@ -108,7 +113,16 @@ function isApproximateFallbackCandidate(error) {
     const providerStatusCode = getProviderStatusCode(error);
     const normalizedErrorCode = String(error?.code || '').toUpperCase();
 
-    return providerStatusCode === 429 ||
+    return [ 401, 403, 429 ].includes(providerStatusCode) ||
+        providerStatusCode >= 500 ||
+        [ 'ECONNABORTED', 'ECONNRESET', 'ENOTFOUND', 'ETIMEDOUT' ].includes(normalizedErrorCode);
+}
+
+function shouldUseGeocodeSuggestionFallback(error) {
+    const providerStatusCode = getProviderStatusCode(error);
+    const normalizedErrorCode = String(error?.code || '').toUpperCase();
+
+    return [ 401, 403, 429 ].includes(providerStatusCode) ||
         providerStatusCode >= 500 ||
         [ 'ECONNABORTED', 'ECONNRESET', 'ENOTFOUND', 'ETIMEDOUT' ].includes(normalizedErrorCode);
 }
@@ -671,17 +685,24 @@ async function requestOlaMaps({
     params = {},
     data = undefined
 }) {
-    const requestParams = {
-        ...params,
-        api_key: getOlaMapsApiKey()
-    };
     const cacheTtlMs = getOlaCacheTtl(path);
     const cacheKey = buildOlaRequestCacheKey({
         method,
         path,
-        params: requestParams
+        params
     });
     const cachedResponse = getCachedOlaResponse(cacheKey);
+    const apiKey = getOlaMapsApiKey();
+    const authParamAttempts = [
+        {
+            ...params,
+            api_key: apiKey
+        },
+        {
+            ...params,
+            key: apiKey
+        }
+    ];
 
     if (cachedResponse && !cachedResponse.isExpired) {
         return cachedResponse.data;
@@ -691,32 +712,54 @@ async function requestOlaMaps({
         return olaInFlightRequests.get(cacheKey);
     }
 
-    const requestPromise = axios({
-        method,
-        url: `${OLA_MAPS_BASE_URL}${path}`,
-        params: requestParams,
-        data,
-        timeout: 15000,
-        headers: {
-            'X-Request-Id': `tripzzy-${Date.now()}`
-        }
-    })
-        .then((response) => {
-            setCachedOlaResponse(cacheKey, response.data, cacheTtlMs);
-            return response.data;
-        })
-        .catch((error) => {
-            if (error?.response?.status === 429) {
-                if (cachedResponse?.data) {
-                    return cachedResponse.data;
+    const requestPromise = (async () => {
+        let lastError = null;
+
+        for (let attemptIndex = 0; attemptIndex < authParamAttempts.length; attemptIndex += 1) {
+            const requestParams = authParamAttempts[ attemptIndex ];
+
+            try {
+                const response = await axios({
+                    method,
+                    url: `${OLA_MAPS_BASE_URL}${path}`,
+                    params: requestParams,
+                    data,
+                    timeout: 15000,
+                    headers: {
+                        'X-Request-Id': `tripzzy-${Date.now()}`
+                    }
+                });
+
+                setCachedOlaResponse(cacheKey, response.data, cacheTtlMs);
+                return response.data;
+            } catch (error) {
+                lastError = error;
+
+                if (error?.response?.status === 429) {
+                    if (cachedResponse?.data) {
+                        return cachedResponse.data;
+                    }
+
+                    throw buildRateLimitError(error);
                 }
 
-                throw buildRateLimitError(error);
-            }
+                const providerStatusCode = getProviderStatusCode(error);
+                const canRetryWithAlternateAuthParam =
+                    attemptIndex < authParamAttempts.length - 1 &&
+                    [ 401, 403 ].includes(providerStatusCode);
 
-            console.error(error?.response?.data || error);
-            throw error;
-        })
+                if (canRetryWithAlternateAuthParam) {
+                    continue;
+                }
+
+                console.error(error?.response?.data || error);
+                throw error;
+            }
+        }
+
+        console.error(lastError?.response?.data || lastError);
+        throw lastError || new Error('Unable to reach Ola Maps');
+    })()
         .finally(() => {
             olaInFlightRequests.delete(cacheKey);
         });
@@ -749,15 +792,37 @@ async function fetchRouteResponse(origin, destination, waypoints = [], options =
 
     const serializedWaypoints = resolvedWaypoints.map((waypoint) => serializeLocation(waypoint));
     try {
-        const routeData = await requestOlaMaps({
-            method: 'post',
-            path: '/routing/v1/directions',
-            params: {
-                origin: serializeLocation(resolvedOrigin),
-                destination: serializeLocation(resolvedDestination),
-                ...(serializedWaypoints.length ? { waypoints: serializedWaypoints.join(', ') } : {})
+        let routeData = null;
+        let lastRouteError = null;
+
+        for (const directionsPath of OLA_DIRECTIONS_PATHS) {
+            try {
+                routeData = await requestOlaMaps({
+                    method: 'post',
+                    path: directionsPath,
+                    params: {
+                        origin: serializeLocation(resolvedOrigin),
+                        destination: serializeLocation(resolvedDestination),
+                        ...(serializedWaypoints.length ? { waypoints: serializedWaypoints.join(', ') } : {})
+                    }
+                });
+                break;
+            } catch (error) {
+                lastRouteError = error;
+                const providerStatusCode = getProviderStatusCode(error);
+                const canTryAlternateDirectionsEndpoint =
+                    directionsPath !== OLA_DIRECTIONS_PATHS[ OLA_DIRECTIONS_PATHS.length - 1 ] &&
+                    [ 401, 403, 404, 405 ].includes(providerStatusCode);
+
+                if (!canTryAlternateDirectionsEndpoint) {
+                    throw error;
+                }
             }
-        });
+        }
+
+        if (!routeData) {
+            throw lastRouteError || new Error('Unable to fetch route directions');
+        }
 
         return {
             routeData,
@@ -979,15 +1044,44 @@ module.exports.getAutoCompleteSuggestions = async (input) => {
         throw new Error('query is required');
     }
 
-    const responseData = await requestOlaMaps({
-        path: '/places/v1/autocomplete',
-        params: {
-            input: String(input).trim()
+    const normalizedInput = String(input).trim();
+    let suggestions = [];
+
+    try {
+        const responseData = await requestOlaMaps({
+            path: '/places/v1/autocomplete',
+            params: {
+                input: normalizedInput
+            }
+        });
+
+        suggestions = getPrimaryCollection(responseData)
+            .map((candidate) => extractSuggestionLabel(candidate))
+            .filter(Boolean);
+    } catch (error) {
+        if (!shouldUseGeocodeSuggestionFallback(error)) {
+            throw error;
         }
-    });
-    const suggestions = getPrimaryCollection(responseData)
-        .map((candidate) => extractSuggestionLabel(candidate))
-        .filter(Boolean);
+
+        try {
+            const geocodeResponseData = await requestOlaMaps({
+                path: '/places/v1/geocode',
+                params: {
+                    address: normalizedInput
+                }
+            });
+
+            suggestions = getPrimaryCollection(geocodeResponseData)
+                .map((candidate) => extractAddressFromCandidate(candidate) || extractSuggestionLabel(candidate))
+                .filter(Boolean);
+        } catch (fallbackError) {
+            if (!shouldUseGeocodeSuggestionFallback(fallbackError)) {
+                throw fallbackError;
+            }
+
+            suggestions = [];
+        }
+    }
 
     if (!suggestions.length) {
         return [];
