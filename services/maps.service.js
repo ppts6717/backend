@@ -77,6 +77,31 @@ module.exports.getAddressCoordinate = async (address) => {
     }
 }
 
+module.exports.getAddressFromCoordinates = async (lat, lng) => {
+    const latitude = Number(lat);
+    const longitude = Number(lng);
+
+    if (Number.isNaN(latitude) || Number.isNaN(longitude)) {
+        throw new Error('Latitude and longitude are required');
+    }
+
+    const apiKey = process.env.GOOGLE_MAPS_API;
+    const url = `https://maps.googleapis.com/maps/api/geocode/json?latlng=${encodeURIComponent(`${latitude},${longitude}`)}&key=${apiKey}`;
+
+    try {
+        const response = await axios.get(url);
+
+        if (response.data.status === 'OK' && response.data.results?.[ 0 ]?.formatted_address) {
+            return response.data.results[ 0 ].formatted_address;
+        }
+
+        throw new Error('Unable to fetch address');
+    } catch (error) {
+        console.error(error);
+        throw error;
+    }
+}
+
 module.exports.getDistanceTime = async (origin, destination) => {
     if (!origin || !destination) {
         throw new Error('Origin and destination are required');
