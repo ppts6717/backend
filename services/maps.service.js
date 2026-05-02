@@ -2,8 +2,14 @@ const axios = require('axios');
 const captainModel = require('../models/captain.model');
 
 const OLA_MAPS_BASE_URL = 'https://api.olamaps.io';
+const NOMINATIM_BASE_URL = 'https://nominatim.openstreetmap.org';
+const OSRM_BASE_URL = 'https://router.project-osrm.org';
 const olaResponseCache = new Map();
 const olaInFlightRequests = new Map();
+const nominatimResponseCache = new Map();
+const nominatimInFlightRequests = new Map();
+const osrmResponseCache = new Map();
+const osrmInFlightRequests = new Map();
 const OLA_CACHE_TTL_MS = {
     '/places/v1/geocode': 1000 * 60 * 60 * 6,
     '/places/v1/reverse-geocode': 1000 * 60 * 30,
@@ -11,10 +17,26 @@ const OLA_CACHE_TTL_MS = {
     '/routing/v1/directions/basic': 1000 * 60 * 5,
     '/routing/v1/directions': 1000 * 60 * 5
 };
+const NOMINATIM_CACHE_TTL_MS = {
+    '/search': 1000 * 60 * 30,
+    '/reverse': 1000 * 60 * 15
+};
+const OSRM_CACHE_TTL_MS = {
+    '/route/v1/driving': 1000 * 60 * 5
+};
 const OLA_DIRECTIONS_PATHS = [
     '/routing/v1/directions/basic',
     '/routing/v1/directions'
 ];
+const NOMINATIM_REQUEST_HEADERS = {
+    Accept: 'application/json',
+    'Accept-Language': 'en-IN,en;q=0.9',
+    'User-Agent': process.env.NOMINATIM_USER_AGENT || 'Tripzzy/1.0 (+https://tripzzy.local)'
+};
+const OSRM_REQUEST_HEADERS = {
+    Accept: 'application/json',
+    'User-Agent': process.env.OSRM_USER_AGENT || 'Tripzzy/1.0 (+https://tripzzy.local)'
+};
 
 function getOlaMapsApiKey() {
     const apiKey = String(process.env.OLA_MAPS_API_KEY || '').trim();
@@ -28,6 +50,14 @@ function getOlaMapsApiKey() {
 
 function getOlaCacheTtl(path) {
     return OLA_CACHE_TTL_MS[ path ] || 0;
+}
+
+function getNominatimCacheTtl(path) {
+    return NOMINATIM_CACHE_TTL_MS[ path ] || 0;
+}
+
+function getOsrmCacheTtl(path) {
+    return OSRM_CACHE_TTL_MS[ path ] || 0;
 }
 
 function serializeCacheValue(value) {
@@ -49,6 +79,25 @@ function serializeCacheValue(value) {
 
 function buildOlaRequestCacheKey({ method, path, params = {} }) {
     return JSON.stringify({
+        provider: 'ola',
+        method: String(method || 'get').toLowerCase(),
+        path,
+        params: serializeCacheValue(params)
+    });
+}
+
+function buildNominatimRequestCacheKey({ method, path, params = {} }) {
+    return JSON.stringify({
+        provider: 'nominatim',
+        method: String(method || 'get').toLowerCase(),
+        path,
+        params: serializeCacheValue(params)
+    });
+}
+
+function buildOsrmRequestCacheKey({ method, path, params = {} }) {
+    return JSON.stringify({
+        provider: 'osrm',
         method: String(method || 'get').toLowerCase(),
         path,
         params: serializeCacheValue(params)
@@ -86,6 +135,68 @@ function setCachedOlaResponse(cacheKey, data, ttlMs) {
     });
 }
 
+function getCachedNominatimResponse(cacheKey) {
+    const cacheEntry = nominatimResponseCache.get(cacheKey);
+
+    if (!cacheEntry) {
+        return null;
+    }
+
+    if (cacheEntry.expiresAt <= Date.now()) {
+        return {
+            ...cacheEntry,
+            isExpired: true
+        };
+    }
+
+    return {
+        ...cacheEntry,
+        isExpired: false
+    };
+}
+
+function setCachedNominatimResponse(cacheKey, data, ttlMs) {
+    if (!ttlMs) {
+        return;
+    }
+
+    nominatimResponseCache.set(cacheKey, {
+        data,
+        expiresAt: Date.now() + ttlMs
+    });
+}
+
+function getCachedOsrmResponse(cacheKey) {
+    const cacheEntry = osrmResponseCache.get(cacheKey);
+
+    if (!cacheEntry) {
+        return null;
+    }
+
+    if (cacheEntry.expiresAt <= Date.now()) {
+        return {
+            ...cacheEntry,
+            isExpired: true
+        };
+    }
+
+    return {
+        ...cacheEntry,
+        isExpired: false
+    };
+}
+
+function setCachedOsrmResponse(cacheKey, data, ttlMs) {
+    if (!ttlMs) {
+        return;
+    }
+
+    osrmResponseCache.set(cacheKey, {
+        data,
+        expiresAt: Date.now() + ttlMs
+    });
+}
+
 function buildRateLimitError(error) {
     const retryAfterSeconds = Number(
         error?.response?.headers?.[ 'retry-after' ] ||
@@ -112,10 +223,18 @@ function getProviderStatusCode(error) {
 function isApproximateFallbackCandidate(error) {
     const providerStatusCode = getProviderStatusCode(error);
     const normalizedErrorCode = String(error?.code || '').toUpperCase();
+    const normalizedErrorMessage = String(
+        error?.message ||
+        error?.response?.data?.message ||
+        ''
+    ).toLowerCase();
 
     return [ 401, 403, 429 ].includes(providerStatusCode) ||
         providerStatusCode >= 500 ||
-        [ 'ECONNABORTED', 'ECONNRESET', 'ENOTFOUND', 'ETIMEDOUT' ].includes(normalizedErrorCode);
+        [ 'ECONNABORTED', 'ECONNRESET', 'ENOTFOUND', 'ETIMEDOUT' ].includes(normalizedErrorCode) ||
+        normalizedErrorMessage.includes('api key is not configured') ||
+        normalizedErrorMessage.includes('no credentials provided') ||
+        normalizedErrorMessage.includes('domain is not allowed');
 }
 
 function shouldUseGeocodeSuggestionFallback(error) {
@@ -768,6 +887,203 @@ async function requestOlaMaps({
     return requestPromise;
 }
 
+async function requestNominatim({
+    method = 'get',
+    path,
+    params = {}
+}) {
+    const cacheTtlMs = getNominatimCacheTtl(path);
+    const cacheKey = buildNominatimRequestCacheKey({
+        method,
+        path,
+        params
+    });
+    const cachedResponse = getCachedNominatimResponse(cacheKey);
+
+    if (cachedResponse && !cachedResponse.isExpired) {
+        return cachedResponse.data;
+    }
+
+    if (nominatimInFlightRequests.has(cacheKey)) {
+        return nominatimInFlightRequests.get(cacheKey);
+    }
+
+    const requestPromise = axios({
+        method,
+        url: `${NOMINATIM_BASE_URL}${path}`,
+        params,
+        timeout: 15000,
+        headers: NOMINATIM_REQUEST_HEADERS
+    })
+        .then((response) => {
+            setCachedNominatimResponse(cacheKey, response.data, cacheTtlMs);
+            return response.data;
+        })
+        .catch((error) => {
+            if (error?.response?.status === 429 && cachedResponse?.data) {
+                return cachedResponse.data;
+            }
+
+            throw error;
+        })
+        .finally(() => {
+            nominatimInFlightRequests.delete(cacheKey);
+        });
+
+    nominatimInFlightRequests.set(cacheKey, requestPromise);
+    return requestPromise;
+}
+
+async function getNominatimSearchResults(query, { limit = 5 } = {}) {
+    const responseData = await requestNominatim({
+        path: '/search',
+        params: {
+            q: String(query || '').trim(),
+            format: 'jsonv2',
+            addressdetails: 1,
+            limit
+        }
+    });
+
+    return Array.isArray(responseData) ? responseData : [];
+}
+
+async function getNominatimReverseGeocodeResult(latitude, longitude) {
+    return requestNominatim({
+        path: '/reverse',
+        params: {
+            lat: latitude,
+            lon: longitude,
+            format: 'jsonv2',
+            addressdetails: 1,
+            zoom: 18
+        }
+    });
+}
+
+function buildCoordinatePairForRoute(coordinate) {
+    const normalizedCoordinate = normalizeCoordinate(coordinate);
+
+    if (!normalizedCoordinate) {
+        throw new Error('Invalid route coordinate provided');
+    }
+
+    return `${normalizedCoordinate.lng},${normalizedCoordinate.ltd}`;
+}
+
+async function requestOsrmRoute({
+    origin,
+    destination,
+    waypoints = []
+}) {
+    const routePath = '/route/v1/driving';
+    const routeCoordinateString = [
+        origin,
+        ...(Array.isArray(waypoints) ? waypoints : []),
+        destination
+    ]
+        .map((coordinate) => buildCoordinatePairForRoute(coordinate))
+        .join(';');
+    const requestPath = `${routePath}/${routeCoordinateString}`;
+    const params = {
+        overview: 'full',
+        geometries: 'geojson',
+        steps: true,
+        annotations: false,
+        alternatives: false,
+        continue_straight: true
+    };
+    const cacheTtlMs = getOsrmCacheTtl(routePath);
+    const cacheKey = buildOsrmRequestCacheKey({
+        method: 'get',
+        path: requestPath,
+        params
+    });
+    const cachedResponse = getCachedOsrmResponse(cacheKey);
+
+    if (cachedResponse && !cachedResponse.isExpired) {
+        return cachedResponse.data;
+    }
+
+    if (osrmInFlightRequests.has(cacheKey)) {
+        return osrmInFlightRequests.get(cacheKey);
+    }
+
+    const requestPromise = axios({
+        method: 'get',
+        url: `${OSRM_BASE_URL}${requestPath}`,
+        params,
+        timeout: 15000,
+        headers: OSRM_REQUEST_HEADERS
+    })
+        .then((response) => {
+            if (response?.data?.code !== 'Ok') {
+                const routeError = new Error(response?.data?.message || 'Unable to fetch road route');
+                routeError.statusCode = 503;
+                throw routeError;
+            }
+
+            setCachedOsrmResponse(cacheKey, response.data, cacheTtlMs);
+            return response.data;
+        })
+        .finally(() => {
+            osrmInFlightRequests.delete(cacheKey);
+        });
+
+    osrmInFlightRequests.set(cacheKey, requestPromise);
+    return requestPromise;
+}
+
+async function fetchOsrmRouteResponse({
+    origin,
+    destination,
+    waypoints = [],
+    resolvedOrigin,
+    resolvedDestination,
+    resolvedWaypoints = []
+}) {
+    const responseData = await requestOsrmRoute({
+        origin: resolvedOrigin,
+        destination: resolvedDestination,
+        waypoints: resolvedWaypoints
+    });
+    const routeStops = [
+        normalizeCoordinate(resolvedOrigin),
+        ...resolvedWaypoints.map((waypoint) => normalizeCoordinate(waypoint)),
+        normalizeCoordinate(resolvedDestination)
+    ].filter(Boolean);
+    const routeInputs = [
+        origin,
+        ...(Array.isArray(waypoints) ? waypoints : []),
+        destination
+    ];
+    const primaryRoute = Array.isArray(responseData?.routes) ? responseData.routes[ 0 ] : null;
+
+    if (!primaryRoute) {
+        const routeError = new Error('Unable to fetch road route');
+        routeError.statusCode = 503;
+        throw routeError;
+    }
+
+    return {
+        ...responseData,
+        provider: 'osrm',
+        routes: [
+            {
+                ...primaryRoute,
+                legs: (Array.isArray(primaryRoute?.legs) ? primaryRoute.legs : []).map((leg, index) => ({
+                    ...leg,
+                    start_location: routeStops[ index ] || null,
+                    end_location: routeStops[ index + 1 ] || null,
+                    start_address: formatLocationLabel(routeInputs[ index ], routeStops[ index ]),
+                    end_address: formatLocationLabel(routeInputs[ index + 1 ], routeStops[ index + 1 ]),
+                    steps: Array.isArray(leg?.steps) ? leg.steps : []
+                }))
+            }
+        ]
+    };
+}
+
 async function resolveRouteLocation(location) {
     if (typeof location === 'string' && location.trim()) {
         return module.exports.getAddressCoordinate(location.trim());
@@ -836,13 +1152,30 @@ async function fetchRouteResponse(origin, destination, waypoints = [], options =
             throw error;
         }
 
-        return {
-            routeData: null,
-            resolvedOrigin,
-            resolvedDestination,
-            resolvedWaypoints,
-            routeError: error
-        };
+        try {
+            return {
+                routeData: await fetchOsrmRouteResponse({
+                    origin,
+                    destination,
+                    waypoints,
+                    resolvedOrigin,
+                    resolvedDestination,
+                    resolvedWaypoints
+                }),
+                resolvedOrigin,
+                resolvedDestination,
+                resolvedWaypoints,
+                routeError: null
+            };
+        } catch (osrmError) {
+            return {
+                routeData: null,
+                resolvedOrigin,
+                resolvedDestination,
+                resolvedWaypoints,
+                routeError: osrmError
+            };
+        }
     }
 }
 
@@ -852,25 +1185,37 @@ module.exports.getAddressCoordinate = async (address) => {
     }
 
     const coordinateFromString = parseCoordinateString(String(address));
+    const normalizedAddress = String(address).trim();
 
     if (coordinateFromString) {
         return coordinateFromString;
     }
 
-    const responseData = await requestOlaMaps({
-        path: '/places/v1/geocode',
-        params: {
-            address: String(address).trim()
-        }
-    });
-    const primaryResult = getPrimaryCollection(responseData)[ 0 ] || responseData;
-    const coordinate = extractCoordinateFromCandidate(primaryResult);
+    try {
+        const responseData = await requestOlaMaps({
+            path: '/places/v1/geocode',
+            params: {
+                address: normalizedAddress
+            }
+        });
+        const primaryResult = getPrimaryCollection(responseData)[ 0 ] || responseData;
+        const coordinate = extractCoordinateFromCandidate(primaryResult);
 
-    if (!coordinate) {
+        if (coordinate) {
+            return coordinate;
+        }
+    } catch (error) {
+        console.warn('Geocode lookup failed on Ola Maps, falling back to Nominatim:', error?.response?.data || error?.message || error);
+    }
+
+    const fallbackResults = await getNominatimSearchResults(normalizedAddress, { limit: 1 });
+    const fallbackCoordinate = extractCoordinateFromCandidate(fallbackResults[ 0 ]);
+
+    if (!fallbackCoordinate) {
         throw new Error('Unable to fetch coordinates');
     }
 
-    return coordinate;
+    return fallbackCoordinate;
 };
 
 module.exports.getAddressFromCoordinates = async (lat, lng) => {
@@ -895,7 +1240,18 @@ module.exports.getAddressFromCoordinates = async (lat, lng) => {
             return formattedAddress;
         }
     } catch (error) {
-        console.error('Reverse geocode lookup failed, falling back to coordinates:', error?.response?.data || error?.message || error);
+        console.warn('Reverse geocode lookup failed on Ola Maps, trying Nominatim:', error?.response?.data || error?.message || error);
+    }
+
+    try {
+        const fallbackResponseData = await getNominatimReverseGeocodeResult(latitude, longitude);
+        const fallbackFormattedAddress = extractAddressFromCandidate(fallbackResponseData);
+
+        if (fallbackFormattedAddress) {
+            return fallbackFormattedAddress;
+        }
+    } catch (error) {
+        console.warn('Reverse geocode lookup failed on Nominatim, falling back to coordinates:', error?.response?.data || error?.message || error);
     }
 
     return formatCoordinateLabel(latitude, longitude);
@@ -1079,6 +1435,17 @@ module.exports.getAutoCompleteSuggestions = async (input) => {
                 throw fallbackError;
             }
 
+            suggestions = [];
+        }
+    }
+
+    if (!suggestions.length) {
+        try {
+            suggestions = (await getNominatimSearchResults(normalizedInput, { limit: 5 }))
+                .map((candidate) => extractAddressFromCandidate(candidate) || extractSuggestionLabel(candidate))
+                .filter(Boolean);
+        } catch (error) {
+            console.warn('Autocomplete lookup failed on Nominatim:', error?.response?.data || error?.message || error);
             suggestions = [];
         }
     }
