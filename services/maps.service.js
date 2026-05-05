@@ -31,11 +31,12 @@ const OLA_DIRECTIONS_PATHS = [
 const NOMINATIM_REQUEST_HEADERS = {
     Accept: 'application/json',
     'Accept-Language': 'en-IN,en;q=0.9',
-    'User-Agent': process.env.NOMINATIM_USER_AGENT || 'Tripzzy/1.0 (+https://tripzzy.local)'
+    'User-Agent': process.env.NOMINATIM_USER_AGENT || 'Tripzzy/1.0 (+https://tripzzyride.web.app)',
+    Referer: process.env.NOMINATIM_REFERER || 'https://tripzzyride.web.app'
 };
 const OSRM_REQUEST_HEADERS = {
     Accept: 'application/json',
-    'User-Agent': process.env.OSRM_USER_AGENT || 'Tripzzy/1.0 (+https://tripzzy.local)'
+    'User-Agent': process.env.OSRM_USER_AGENT || 'Tripzzy/1.0 (+https://tripzzyride.web.app)'
 };
 
 function getOlaMapsApiKey() {
